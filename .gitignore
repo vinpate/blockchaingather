@@ -1,0 +1,22 @@
+# Generated blockchain-gather output files
+blockchain-gather-*
+blockchain-gather.*
+*.tar.gz
+
+# Vim swap files
+*.swp
+*.swu
+*~
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

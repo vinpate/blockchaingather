@@ -1,0 +1,987 @@
+#!/bin/sh
+#
+# blockchain-node-gather - a data collection script for debugging blockchain node issues.
+#
+# This script is non-invasive and can be run on production blockchain
+# nodes with no ill effect.
+#
+# Copyright (C) 2024 Nirvana Labs. All rights reserved.
+#
+# This software is proprietary and confidential. It is intended for use by
+# Nirvana Labs and authorized parties only. Unauthorized copying, distribution,
+# modification, or use of this software is strictly prohibited and may result
+# in legal action.
+#
+# This program is provided "as is" without warranty of any kind, either express
+# or implied, including but not limited to the implied warranties of
+# merchantability and fitness for a particular purpose.
+#
+# For licensing inquiries, contact: support@nirvanalabs.io
+#
+
+export LC_ALL=C
+
+# Defines
+NODE_PID=""
+NODE_PID_COMMA=""
+UPLOAD=""
+STATCMD=""
+ITEM=0
+TOPDIR=$(mktemp -d ${TMPDIR:-/tmp}/blockchain-gather.XXXXXXXX)
+ID="$(cat /etc/hostname)-$(date +'%Y%m%d-%H%M%S')"
+RELDIR="blockchain-gather-$ID"
+ORIGPWD=$PWD
+VERSION=1.0
+USERID=$(id -u)
+
+# Helpers
+
+# Takes a string, translates it into something we can use as a log
+# file name
+n_opt() {
+	echo "$1" | tr '/ ' __
+}
+
+item_num() {
+	printf "%.3d" "$ITEM"
+}
+
+logname() {
+	echo "$@" | tr -c '[:alnum:]-' '[_*]' | sed 's/_*$//'
+}
+
+log() {
+	echo "$*" >>"$LOG"
+}
+
+info() {
+	echo "Info: $*" >&2
+	log "$@"
+}
+
+warn() {
+	echo "Warning: $*" >&2
+	log "$@"
+}
+
+incr() {
+	ITEM=$((ITEM + 1))
+}
+
+taskecho() {
+	echo "Task: $ITEM: $*"
+}
+
+banner() {
+	log "--------------------------------"
+	log "Item $ITEM: $*"
+	log "--------------------------------"
+	taskecho "$*"
+}
+
+run() {
+	incr
+
+	command -v "$1" >/dev/null 2>&1 || return 0
+
+	OLDLOG="$LOG"
+	LOG="${DIR}/$(item_num)_$(logname "$@")"
+	banner "$@"
+	("$@") >>"$LOG" 2>&1
+	LOG="$OLDLOG"
+}
+
+runpipe_recurse() {
+	CMD="$1";
+	shift;
+	if [ "x$*" = "x" ]; then
+		${CMD} 2>&1
+	else
+		${CMD} 2>&1 | runpipe_recurse "$@"
+	fi
+}
+
+pipeprint() {
+	CMD="$1";
+	shift;
+	if [ "x$*" = "x" ]; then
+		echo ${CMD}
+	else
+		echo ${CMD} "|" $(pipeprint "$@")
+	fi
+}
+
+runpipe() {
+	incr
+	OLDLOG="$LOG"
+	LOG="${DIR}/$(item_num)_$(logname "$@")"
+	banner $(pipeprint "$@")
+	runpipe_recurse "$@" >> ${LOG} 2>&1
+	LOG="$OLDLOG"
+}
+
+mycat() {
+	if [ -r $1 ]; then
+		run cat $1
+	else
+		incr
+	fi
+}
+
+get_pid() {
+	pidir="$(ls /proc/ | grep -E '^[0-9]+$' 2>&1)"
+	# NODE_PID detection is now handled automatically in the main script
+
+	if [ -z "${NODE_PID_COMMA}" ]; then
+		NODE_PID_COMMA=$(echo "${NODE_PID}" | tr '\n' ' ' | sed 's/ /,/g')
+	fi
+}
+
+install_required_packages() {
+	info "Checking and installing required packages for Ubuntu 22.04+..."
+	
+	# Check if we're on Ubuntu/Debian
+	if ! command -v apt-get >/dev/null 2>&1; then
+		warn "This script is designed for Ubuntu 22.04+ with apt package manager"
+		warn "Current system may not be fully supported"
+		return 1
+	fi
+	
+	# Check Ubuntu version
+	if [ -f /etc/os-release ]; then
+		. /etc/os-release
+		if [ "$ID" = "ubuntu" ]; then
+			UBUNTU_VERSION=$(echo "$VERSION_ID" | cut -d. -f1)
+			if [ "$UBUNTU_VERSION" -lt 22 ]; then
+				warn "This script is optimized for Ubuntu 22.04+. Current version: $VERSION_ID"
+				warn "Some features may not work correctly"
+			fi
+		fi
+	fi
+	
+	# All required packages for Ubuntu 22.04+ blockchain node diagnostics
+	REQUIRED_PACKAGES="procps net-tools util-linux coreutils iproute2 sysstat iotop htop lvm2 nvme-cli lsof pciutils jq curl wget psmisc dnsutils"
+	
+	# Check which packages are missing
+	missing_packages=""
+	for package in $REQUIRED_PACKAGES; do
+		# Check if command exists or package is installed
+		if ! command -v "$package" >/dev/null 2>&1 && ! dpkg -l "$package" >/dev/null 2>&1; then
+			missing_packages="$missing_packages $package"
+		fi
+	done
+	
+	if [ -n "$missing_packages" ]; then
+		info "Installing missing packages:$missing_packages"
+		
+		# Update package lists
+		info "Updating package lists..."
+		apt update
+		
+		# Install missing packages
+		info "Installing packages..."
+		apt install -y $missing_packages
+		
+		if [ $? -eq 0 ]; then
+			info "Successfully installed required packages"
+		else
+			warn "Some packages failed to install. The script may not work completely."
+		fi
+	else
+		info "All required packages are already installed"
+	fi
+}
+
+check_tools() {
+	missing=
+	for command in systemctl journalctl ps netstat ss; do
+		if [ ! $(command -v $command) ]; then
+			missing="$missing$command "
+		fi
+	done
+	if [ -n "$missing" ]; then
+		echo "#######################################################"
+		echo "Some binaries are missing from PATH, the results might"
+		echo "not be complete:"
+		echo ""
+		echo "    $missing"
+		echo ""
+		echo "Please amend your PATH and run again."
+		echo "#######################################################"
+		sleep 10
+	fi
+}
+
+show_packages() {
+	run dpkg --list "$@"
+	run dpkg --status "$@"
+	run rpm --query --all "$@"
+	run rpm --query --all --info "$@"
+}
+
+show_limits() {
+	# Get the first blockchain process PID, or use self if none found
+	if [ -n "$NODE_PID" ]; then
+		pid=$(echo $NODE_PID | awk '{print $1;}')
+	else
+		pid=$$
+	fi
+	file="/proc/$pid/limits"
+
+	incr
+
+	OLDLOG="$LOG"
+	LOG="${DIR}/$(item_num)_limits"
+	banner limits
+	log "$file"
+	cat "$file" >> ${LOG} 2>&1
+	LOG="$OLDLOG"
+}
+
+blockdev_cat() {
+	echo -n >>${LOG} "$1:"
+	cat "$1" >> ${LOG} 2>&1
+}
+
+call_blockdev() {
+	incr
+
+	OLDLOG="$LOG"
+	LOG="${DIR}/$(item_num)_blockdev_info_$(logname "$1")"
+	banner "blockdev info $1"
+	blockdev_cat "$1/device/model"
+	blockdev_cat "$1/queue/logical_block_size"
+	blockdev_cat "$1/queue/physical_block_size"
+	blockdev_cat "$1/queue/read_ahead_kb"
+	blockdev_cat "$1/queue/minimum_io_size"
+	blockdev_cat "$1/queue/optimal_io_size"
+	LOG="$OLDLOG"
+}
+
+nvme_diagnostics() {
+	incr
+	OLDLOG="$LOG"
+	LOG="${DIR}/$(item_num)_nvme_diagnostics"
+	banner "NVMe Drive Diagnostics"
+	
+	# Check if nvme-cli is available
+	if ! command -v nvme >/dev/null 2>&1; then
+		log "nvme-cli not available, skipping NVMe diagnostics"
+		return 0
+	fi
+	
+	# Get NVMe drives
+	nvme_drives=$(lsblk -o NAME | grep '^nvme' | sort)
+	
+	for nvme_drive in $nvme_drives; do
+		drive_path="/dev/$nvme_drive"
+		log "=== NVMe Drive: $drive_path ==="
+		
+		# Basic NVMe info
+		run nvme id-ns --human-readable "$drive_path"
+		
+		# LBA Format information
+		run nvme id-ns --human-readable "$drive_path" | grep '^LBA Format'
+		
+		# Detailed JSON analysis if jq is available
+		if command -v jq >/dev/null 2>&1; then
+			# Get JSON output and validate it before processing
+			json_output=$(nvme id-ns -o json "$drive_path" 2>/dev/null)
+			if echo "$json_output" | jq empty 2>/dev/null; then
+				# JSON is valid, process it
+				echo "$json_output" | jq --arg drive "$drive_path" '{
+					"drive": $drive,
+					"currently_active": {
+						"index": .flbas,
+						"data_size": .lbafs[.flbas].ds,
+						"relative_performance": .lbafs[.flbas].rp
+					},
+					"optimal_format": (
+						.lbafs | to_entries |
+						(map(select(.value.rp == 0)) | if length > 0 then . else .lbafs | to_entries end) |
+						max_by(.value.ds) | {
+							"index": .key,
+							"data_size": .value.ds,
+							"relative_performance": .value.rp
+						}
+					),
+					"is_optimal": (
+						.flbas == (
+							.lbafs | to_entries |
+							(map(select(.value.rp == 0)) | if length > 0 then . else .lbafs | to_entries end) |
+							max_by(.value.ds) | .key
+						)
+					)
+				}' >> "$LOG" 2>&1
+			else
+				log "Warning: Invalid JSON output from nvme id-ns for $drive_path"
+				log "Raw output: $json_output"
+			fi
+		fi
+		
+		log ""
+	done
+	
+	LOG="$OLDLOG"
+}
+
+zfs_diagnostics() {
+	incr
+	OLDLOG="$LOG"
+	LOG="${DIR}/$(item_num)_zfs_diagnostics"
+	banner "ZFS Diagnostics"
+	
+	# Check if ZFS is available
+	if command -v zfs >/dev/null 2>&1; then
+		run zfs version
+		run zpool list
+		run zfs list
+		run zpool status
+		run zfs get all
+		run zpool get all
+		run zfs get -H -o name,property,value,source all | head -50
+		run zpool get -H -o name,property,value,source all | head -50
+	else
+		log "ZFS not available on this system"
+	fi
+	
+	LOG="$OLDLOG"
+}
+
+generate_summary() {
+	incr
+	OLDLOG="$LOG"
+	LOG="${DIR}/$(item_num)_summary_report"
+	banner "Generating Summary Report"
+	
+	# Create a comprehensive summary file
+	SUMMARY_FILE="${DIR}/SYSTEM_SUMMARY.txt"
+	
+	{
+		echo "==============================================================================="
+		echo "BLOCKCHAIN NODE SYSTEM SUMMARY REPORT"
+		echo "==============================================================================="
+		echo "Generated: $(date)"
+		echo "Hostname: $(hostname)"
+		echo "Script Version: $VERSION"
+		echo ""
+		
+		# System Overview
+		echo "🖥️  SYSTEM OVERVIEW"
+		echo "==============================================================================="
+		# Find files by command name instead of hardcoded numbers
+		LSB_FILE=$(find "${DIR}" -name "*lsb_release_-a" | head -1)
+		if [ -r "$LSB_FILE" ]; then
+			echo "Operating System:"
+			grep -A 3 "lsb_release -a" "$LSB_FILE" | grep -E "(Description|Release|Codename)" | sed 's/^/  /'
+		fi
+		
+		UNAME_FILE=$(find "${DIR}" -name "*uname_-a" | head -1)
+		if [ -r "$UNAME_FILE" ]; then
+			echo "Kernel:"
+			cat "$UNAME_FILE" | tail -1 | sed 's/^/  /'
+		fi
+		
+		UPTIME_FILE=$(find "${DIR}" -name "*uptime" | head -1)
+		if [ -r "$UPTIME_FILE" ]; then
+			echo "Uptime:"
+			cat "$UPTIME_FILE" | tail -1 | sed 's/^/  /'
+		fi
+		echo ""
+		
+		# Hardware Information
+		echo "💻 HARDWARE SPECIFICATIONS"
+		echo "==============================================================================="
+		CPUINFO_FILE=$(find "${DIR}" -name "*cat__proc_cpuinfo" | head -1)
+		if [ -r "$CPUINFO_FILE" ]; then
+			echo "CPU Information:"
+			grep -A 5 "processor.*: 0" "$CPUINFO_FILE" | grep -E "(model name|cpu cores|siblings)" | sed 's/^/  /'
+		fi
+		
+		# CPU Performance Data (if available)
+		LSCPU_FILE=$(find "${DIR}" -name "*lscpu" | head -1)
+		if [ -r "$LSCPU_FILE" ]; then
+			echo "CPU Performance:"
+			grep -E "(CPU.*scaling MHz|CPU max MHz|CPU min MHz)" "$LSCPU_FILE" | sed 's/^/  /'
+		fi
+		
+		CPUPOWER_FILE=$(find "${DIR}" -name "*cpupower_monitor" | head -1)
+		if [ -r "$CPUPOWER_FILE" ]; then
+			echo "CPU Usage & Idle States:"
+			grep -A 5 "Mperf" "$CPUPOWER_FILE" | head -3 | sed 's/^/  /'
+		fi
+		
+		FREE_FILE=$(find "${DIR}" -name "*free_-m" | head -1)
+		if [ -r "$FREE_FILE" ]; then
+			echo "Memory:"
+			grep -A 3 "free -m" "$FREE_FILE" | grep -E "(Mem:|total|used|available)" | sed 's/^/  /'
+		fi
+		
+		DF_FILE=$(find "${DIR}" -name "*df_-h" | head -1)
+		if [ -r "$DF_FILE" ]; then
+			echo "Storage:"
+			grep -A 10 "df -h" "$DF_FILE" | sed 's/^/  /'
+		fi
+		echo ""
+		
+		# Blockchain Node Information
+		echo "⛓️  BLOCKCHAIN NODE STATUS"
+		echo "==============================================================================="
+		echo "Active Blockchain Processes:"
+		ps aux | grep -E "(op-reth|op-node|geth|erigon|parity|besu|nethermind)" | grep -v grep | head -5 | awk '{print "  PID:", $2, "CPU:", $3"%", "MEM:", $4"%", "VSZ:", $5, "RSS:", $6, "CMD:", $11}' | sed 's/^/  /'
+		
+		echo "Top Resource Consumers:"
+		ps -o pid,user,pmem,vsz,rss,comm --sort=-pmem | grep -E "(op-reth|op-node)" | head -3 | awk '{print "  PID:", $1, "USER:", $2, "MEM:", $3"%", "VSZ:", $4, "RSS:", $5, "CMD:", $6}' | sed 's/^/  /'
+		echo ""
+		
+		# Docker Information
+		echo "🐳 DOCKER CONTAINER STATUS"
+		echo "==============================================================================="
+		echo "Running Containers:"
+		docker ps -a | grep -E "(CONTAINER|Up)" | head -5 | sed 's/^/  /'
+		echo ""
+		
+		# Network Services
+		echo "🌐 NETWORK SERVICES"
+		echo "==============================================================================="
+		
+		# Enhanced blockchain port detection with service grouping
+		echo "Blockchain Services by Container/Process:"
+		
+		# Group by Docker containers
+		if command -v docker >/dev/null 2>&1; then
+			echo "  📦 Docker Containers:"
+			docker ps --format "table {{.Names}}\t{{.Ports}}" | grep -E "(eth|geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)" | while read line; do
+				echo "    $line" | sed 's/^/      /'
+			done
+			echo ""
+		fi
+		
+		# Group by running processes with enhanced detection
+		echo "  🔧 Running Processes:"
+		ps aux | grep -E "(geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)" | grep -v grep | while read line; do
+			process_name=$(echo "$line" | awk '{print $11}' | sed 's/.*\///')
+			pid=$(echo "$line" | awk '{print $2}')
+			user=$(echo "$line" | awk '{print $1}')
+			cpu=$(echo "$line" | awk '{print $3}')
+			mem=$(echo "$line" | awk '{print $4}')
+			
+			# Get ports for this process
+			ports=$(netstat -tulnp 2>/dev/null | grep "$pid/" | grep -oE ':[0-9]+' | cut -d: -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+			
+			# Get command line arguments for port detection
+			cmd_line=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i}' | sed 's/ $//')
+			cmd_ports=$(echo "$cmd_line" | grep -oE '(port|rpc|ws|http|metrics|discovery|authrpc)\.port[=:][0-9]+|--port[=:][0-9]+|--rpc\.port[=:][0-9]+|--ws\.port[=:][0-9]+|--metrics[=:][0-9]+|--discovery\.port[=:][0-9]+|--authrpc\.port[=:][0-9]+' | grep -oE '[0-9]+' | tr '\n' ',' | sed 's/,$//')
+			
+			if [ -n "$ports" ] || [ -n "$cmd_ports" ]; then
+				all_ports=$(echo "$ports,$cmd_ports" | tr ',' '\n' | grep -v '^$' | sort -u | tr '\n' ',' | sed 's/,$//')
+				echo "    $process_name (PID: $pid, User: $user, CPU: ${cpu}%, MEM: ${mem}%) - Ports: $all_ports" | sed 's/^/      /'
+				echo "      Command: $cmd_line" | sed 's/^/        /'
+			fi
+		done
+		echo ""
+		
+		# All detected blockchain ports (TCP and UDP)
+		echo "  📊 All Blockchain Ports (TCP & UDP):"
+		ALL_BLOCKCHAIN_PORTS=$(netstat -tulnp | grep -E ':(8[0-9]{3}|9[0-9]{3}|30303|6060|7300|7301|7545|8545|8546|8551|9222)' | grep -oE ':[0-9]+' | cut -d: -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+		if [ -n "$ALL_BLOCKCHAIN_PORTS" ]; then
+			echo "    $ALL_BLOCKCHAIN_PORTS" | sed 's/^/      /'
+		fi
+		echo ""
+		
+		# Ultimate blockchain port detection function (TCP and UDP)
+		detect_blockchain_ports() {
+			# Method 1: Port range detection (8xxx-9xxx + common blockchain ports) - includes UDP
+			PORTS1=$(netstat -tulnp | grep -E ':(8[0-9]{3}|9[0-9]{3}|30303|6060|7300|7301|7545|8545|8546|8551|9222)' | grep -oE ':[0-9]+' | cut -d: -f2 | sort -u)
+			
+			# Method 2: Docker container detection
+			PORTS2=$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -E '(eth|geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)' | grep -oE '[0-9]+->[0-9]+' | cut -d: -f1 | sort -u)
+			
+			# Method 3: Process command line detection
+			PORTS3=$(ps aux | grep -E '(geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)' | grep -v grep | grep -oE '(port|rpc|ws|http|metrics|discovery|authrpc)\.port[=:][0-9]+|--port[=:][0-9]+|--rpc\.port[=:][0-9]+|--ws\.port[=:][0-9]+|--metrics[=:][0-9]+|--discovery\.port[=:][0-9]+|--authrpc\.port[=:][0-9]+' | grep -oE '[0-9]+' | sort -u)
+			
+			# Combine all methods, remove duplicates, and format
+			echo "$PORTS1 $PORTS2 $PORTS3" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' '|' | sed 's/|$//'
+		}
+		
+		# Use the enhanced detection
+		BLOCKCHAIN_PORTS=$(detect_blockchain_ports)
+		
+		echo "Active UFW Ports (Blockchain & Key Services):"
+		if [ -n "$BLOCKCHAIN_PORTS" ]; then
+			ufw status numbered | grep -E "($BLOCKCHAIN_PORTS|443|9100)" | grep -v "22/tcp" | sed 's/^/  /'
+		else
+			ufw status numbered | grep -E "(443|9100)" | sed 's/^/  /'
+		fi
+		echo ""
+		
+		# Enhanced service mapping (TCP and UDP)
+		echo "  🔍 Detailed Service Mapping:"
+		
+		# Map each detected port to its service (both TCP and UDP)
+		if [ -n "$BLOCKCHAIN_PORTS" ]; then
+			IFS='|' read -ra PORTS_ARRAY <<< "$BLOCKCHAIN_PORTS"
+			for port in "${PORTS_ARRAY[@]}"; do
+				if [ -n "$port" ]; then
+					# Find what's listening on this port (both TCP and UDP)
+					netstat -tulnp | grep ":$port " | while read service_info; do
+						if [ -n "$service_info" ]; then
+							proto=$(echo "$service_info" | awk '{print $1}')
+							address=$(echo "$service_info" | awk '{print $4}')
+							process=$(echo "$service_info" | awk '{print $7}')
+							
+							echo "    Port $port: $proto $address -> $process" | sed 's/^/      /'
+						fi
+					done
+				fi
+			done
+		fi
+		echo ""
+		
+		echo "All Services Listening:"
+		netstat -tuln | grep LISTEN | sed 's/^/  /'
+		echo ""
+		
+		# Storage Analysis
+		echo "💾 STORAGE ANALYSIS"
+		echo "==============================================================================="
+		NVME_FILE=$(find "${DIR}" -name "*nvme_diagnostics" | head -1)
+		if [ -r "$NVME_FILE" ]; then
+			echo "NVMe Drive Status:"
+			# Extract drive information more comprehensively
+			grep -A 100 "NVMe Drive Diagnostics" "$NVME_FILE" | grep -E "(drive.*nvme|is_optimal.*false|is_optimal.*true)" | sed 's/^/  /'
+		fi
+		
+		echo "Block Devices:"
+		# Use lsblk -e 7 directly to exclude loop devices (major number 7)
+		lsblk -e 7 | sed 's/^/  /'
+		echo ""
+		
+		# Key Findings
+		echo "🔍 KEY FINDINGS"
+		echo "==============================================================================="
+		
+		# Check for high memory usage
+		MEMORY_USAGE=$(ps -o pid,user,pmem,comm --sort=-pmem | grep "op-reth" | awk '{print $3}' | head -1 | sed 's/%//' 2>/dev/null)
+		# Sanitize the memory usage to ensure it's a single integer
+		MEMORY_USAGE=$(echo "$MEMORY_USAGE" | tr -d '\n\r' | awk '{print $1}')
+		if [ -n "$MEMORY_USAGE" ] && [ "$MEMORY_USAGE" -gt 80 ] 2>/dev/null; then
+			echo "⚠️  HIGH MEMORY USAGE: op-reth using ${MEMORY_USAGE}% of system memory"
+		fi
+		
+		# Check NVMe optimization
+		NVME_FILE=$(find "${DIR}" -name "*nvme_diagnostics" | head -1)
+		if [ -r "$NVME_FILE" ]; then
+			OPTIMAL_COUNT=$(grep -c "is_optimal.*false" "$NVME_FILE" 2>/dev/null || echo "0")
+			# Sanitize the count to ensure it's a single integer
+			OPTIMAL_COUNT=$(echo "$OPTIMAL_COUNT" | tr -d '\n\r' | awk '{print $1}')
+			if [ -n "$OPTIMAL_COUNT" ] && [ "$OPTIMAL_COUNT" -gt 0 ] 2>/dev/null; then
+				echo "⚠️  NVMe OPTIMIZATION: $OPTIMAL_COUNT drive(s) not using optimal sector size (4KB)"
+			fi
+		fi
+		
+		# Check disk usage
+		ROOT_USAGE=$(df -h | grep "/dev/md0" | awk '{print $5}' | sed 's/%//' 2>/dev/null)
+		# Sanitize the disk usage to ensure it's a single integer
+		ROOT_USAGE=$(echo "$ROOT_USAGE" | tr -d '\n\r' | awk '{print $1}')
+		if [ -n "$ROOT_USAGE" ] && [ "$ROOT_USAGE" -gt 80 ]; then
+			echo "⚠️  HIGH DISK USAGE: Root filesystem ${ROOT_USAGE}% full"
+		fi
+		
+		# Check uptime
+		UPTIME_DAYS=$(uptime | grep -o "up [0-9]* days" | grep -o "[0-9]*" 2>/dev/null)
+		# Sanitize the uptime to ensure it's a single integer
+		UPTIME_DAYS=$(echo "$UPTIME_DAYS" | tr -d '\n\r' | awk '{print $1}')
+		if [ -n "$UPTIME_DAYS" ] && [ "$UPTIME_DAYS" -gt 30 ]; then
+			echo "✅ EXCELLENT STABILITY: System uptime ${UPTIME_DAYS} days"
+		fi
+		echo ""
+		
+		echo "==============================================================================="
+		echo "END OF SUMMARY REPORT"
+		echo "==============================================================================="
+		
+	} > "$SUMMARY_FILE"
+	
+	log "Summary report generated: $SUMMARY_FILE"
+	LOG="$OLDLOG"
+}
+
+upload_fail() {
+	warn "$1"
+	echo "==============================================================================="
+	echo "Please submit the file: $TGZ"
+	echo "==============================================================================="
+}
+
+# Upload gather to filebin using curl - TEMPORARILY DISABLED
+# upload() {
+# 	if command -v curl >/dev/null
+# 	then
+# 			FILEBIN="https://filebin.nirvanalabs.io"
+# 			# Generate BIN name
+# 			BIN=$(head /dev/urandom | tr -dc a-z0-9 | head -c16)-T$UPLOAD
+# 			TGZ="blockchain-gather.${ID}.tar.gz"
+# 			if test ! -f ${TGZ}
+# 			then
+# 				echo "Error: The file ${TGZ} does not exist. No file to upload."
+# 				return 1
+# 			fi
+
+# 			URL="${FILEBIN}/${BIN}/${TGZ}"
+# 			CURLSTATUS=$(curl --data-binary "@$TGZ" $URL \
+# 				--header "Blockchain-gather: ${VERSION}" \
+# 				--progress-bar --silent --output /dev/null \
+# 				--connect-timeout 60 --max-time 1800 \
+# 				--write-out '%{http_code}')
+# 			if [ ! "$CURLSTATUS" -eq "201" ]
+# 			then
+# 				upload_fail "Failed to upload $TGZ to $FILEBIN, http status code: $CURLSTATUS"
+# 				return 0
+# 			fi
+# 			echo "==============================================================================="
+# 			echo "blockchain-gather $TGZ"
+# 			echo "Uploaded to: $FILEBIN/$BIN"
+# 			echo "==============================================================================="
+# 	else
+# 		upload_fail "\"curl\" binary not found in path, please submit file by uploading to $FILEBIN"
+# 	fi
+# }
+
+usage() {
+	cat <<_EOF_
+Usage: $0 [-h] [-p] [-s] [-u identifier]
+
+Blockchain-gather gathers various system information into a single tar-ball.
+
+ -h                   Show this help text
+ -p                   Perform CPU performance monitoring (frequencies, idle states, power management)
+ -s                   Run only storage diagnostics (NVMe, ZFS, disk info)
+ -u <identifier>      Upload generated gather to filebin.nirvanalabs.io (TEMPORARILY DISABLED)
+
+The script automatically detects all blockchain node processes and their
+arguments. No additional configuration is needed.
+_EOF_
+	exit $1
+}
+
+##############################
+# Proper execution starts here
+##############################
+
+while getopts hpsu: opt
+do
+	case $opt in
+	p) PERF="TRUE" ;;
+	s) STORAGE="TRUE" ;;
+	u) UPLOAD=$OPTARG ;; # TEMPORARILY DISABLED
+	h)
+		usage 0
+		;;
+	*)
+		usage 1
+		;;
+	esac
+done
+
+shift $((OPTIND - 1))
+
+if [ $# -gt 0 ]
+then
+	info "Unknown argument: $1"
+	usage 1
+fi
+
+STATCMD=$NAME
+
+# Set up environment
+DIR="$TOPDIR/$RELDIR"
+LOG="$DIR/blockchain-gather.log"
+
+mkdir -p "$DIR"
+cd "$DIR"
+
+cleanup () {
+	rm -rf "$TOPDIR"
+	exit 1
+}
+trap cleanup EXIT 2
+
+info "Blockchain-gather version: $VERSION"
+info "Invoked by: $USERID"
+info "Command line: $*"
+info "Working directory: $DIR"
+
+if [ "${USERID}" -ne "0" ]; then
+	echo "#######################################################"
+	echo "Running as non-root, the results might not be complete."
+	echo "Please run again as root."
+	echo "#######################################################"
+	sleep 10
+fi
+
+# Install required packages first
+install_required_packages
+
+check_tools
+
+if [ ! $(command -v pidof) ] || [ ! $(command -v pgrep) ]; then
+	 get_pid
+fi
+
+# Node type detection is now automatic
+
+# If storage-only mode, run only storage diagnostics and exit
+if [ "$STORAGE" = "TRUE" ]; then
+	info "Running in storage-only mode"
+	run date
+	run hostname
+	run uname -a
+	run lsb_release -a
+run df -h
+run lsblk
+nvme_diagnostics
+	zfs_diagnostics
+	run lspci -vv -nn -k
+	cd "$ORIGPWD"
+	TGZ="blockchain-gather-storage.${ID}.tar.gz"
+	tar czf "$TGZ" -C "$TOPDIR" "$RELDIR"
+	echo "==============================================================================="
+	echo "Storage diagnostics complete. Please submit the file: $TGZ"
+	echo "==============================================================================="
+	exit 0
+fi
+run date
+run dmesg
+run dmesg -T
+run hostname
+mycat /etc/hostname
+mycat /var/log/dmesg
+mycat /proc/cpuinfo
+mycat /proc/version
+runpipe "ps aux" "egrep (geth|erigon|parity|besu|nethermind|bitcoin|ethereum|blockchain|node|op-reth|op-node|reth|anvil|foundry)"
+runpipe "netstat -np" "wc -l"
+runpipe "netstat -np" "grep ESTABLISHED" "wc -l"
+run uptime
+run free -m
+runpipe "ps axo pid,user,pmem,vsz,rss,exe,comm k -pmem" "head -n 11"
+run vmstat -w 1 3
+run mpstat -P ALL 1 3
+run iostat 1 3
+run lsb_release -a
+mycat /etc/redhat-release
+run sysctl -a
+run getenforce
+run umask
+
+show_packages \
+	'geth*' \
+	'erigon*' \
+	'parity*' \
+	'besu*' \
+	'nethermind*' \
+	'bitcoin*' \
+	'*ethereum*' \
+	'*blockchain*' \
+	'*node*' \
+	'*reth*' \
+	'*op-*' \
+	'*foundry*' \
+	'*anvil*' \
+	'docker*' \
+	'containerd*' \
+	gcc \
+	'*jemalloc*' \
+	'*pcre*' \
+	'*openssl*'\
+	'*libssl*'\
+	'nvme-cli' \
+	'jq' \
+	ca-certificates
+
+run systemctl cat \
+	ethereum \
+	geth \
+	erigon \
+	parity \
+	besu \
+	nethermind \
+	bitcoin \
+	op-reth \
+	op-node \
+	reth
+
+# Docker container information
+run docker ps -a
+run docker images | head -20
+run docker stats --no-stream
+run docker system df
+
+run netstat -s
+run ip a
+run ip n
+run ip r
+run ip -s l
+run ifconfig
+run uname -a
+run mount
+runpipe mount sort
+run df -h
+run fdisk -l
+run lvdisplay -vm
+run vgdisplay -v
+run pvdisplay -v
+
+NETSTAT="/bin/netstat"
+run "$NETSTAT" -nlpt
+run "$NETSTAT" -np
+
+# Comprehensive Network Diagnostics
+banner "UFW Firewall Status"
+run ufw status numbered
+
+banner "All Listening Ports"
+run netstat -tuln | grep LISTEN
+
+banner "Network Interface Statistics"
+run ip -s link show
+
+banner "Routing Table"
+run ip route show
+
+banner "ARP Table"
+run ip neigh show
+
+banner "Blockchain Network Analysis"
+run netstat -tulnp | grep -E "(op-reth|op-node|geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|docker-prox)"
+
+banner "Network Connections by Process"
+run netstat -tulnp | awk 'NR>2 {print $7}' | cut -d/ -f2 | sort | uniq -c | sort -nr | head -10
+
+banner "Detailed Process Information"
+# Get top processes by connection count
+TOP_PROCESSES=$(netstat -tulnp | awk 'NR>2 {print $7}' | cut -d/ -f2 | sort | uniq -c | sort -nr | head -10 | awk '{print $2}' | grep -v '^$')
+
+for process in $TOP_PROCESSES; do
+    if [ -n "$process" ]; then
+        log "=== Process: $process ==="
+        # Get process details
+        run ps aux | grep "$process" | grep -v grep | head -3
+        # Get memory and CPU usage
+        run ps -o pid,user,pmem,pcpu,vsz,rss,comm,cmd --sort=-pmem | grep "$process" | head -3
+        # Get network connections for this process
+        run netstat -tulnp | grep "$process" | head -5
+        log ""
+    fi
+done
+
+mycat /etc/init.d/ethereum
+mycat /etc/default/ethereum
+mycat /etc/sysconfig/ethereum
+mycat /sys/kernel/mm/transparent_hugepage/enabled
+mycat /sys/kernel/mm/redhat_transparent_hugepage/enabled
+mycat /proc/user_beancounters
+mycat /proc/meminfo
+mycat /proc/crypto
+mycat /proc/sys/net/ipv4/tcp_tw_reuse
+for pid in ${NODE_PID}; do
+	run cat -v /proc/$pid/cmdline
+	mycat /proc/$pid/cgroup
+done
+show_limits
+
+mycat /etc/hosts
+mycat /etc/resolv.conf
+mycat /etc/nsswitch.conf
+
+run find /usr/local -name "*ethereum*" -o -name "*geth*" -o -name "*erigon*"
+
+# lsof
+for pid in ${NODE_PID}; do
+	run lsof -p $pid
+done
+
+for a in /sys/block/*; do
+	call_blockdev "$a"
+done
+
+run lsblk
+
+# Always include NVMe diagnostics
+nvme_diagnostics
+
+for a in /var/log/messages /var/log/syslog; do
+	if [ -r "$a" ]; then
+		run egrep -i "(ethereum|geth|erigon|parity|besu|nethermind|bitcoin|blockchain|node|op-reth|op-node|reth|anvil|foundry|base|optimism|arbitrum|polygon)" "$a"
+	else
+		incr
+	fi
+done
+
+# ip tables
+if  (lsmod | grep ip_tables > /dev/null); then
+	run iptables-save
+fi
+
+if  (lsmod | grep ip6_tables > /dev/null); then
+	run ip6tables-save
+fi
+
+# maps
+for pid in ${NODE_PID}; do
+	runpipe "awk '$2 ~ \"rw\"' /proc/$pid/maps" "wc -l"
+done
+
+# Pick up the basic memory offset the text segments are in.
+for pid in ${NODE_PID}; do
+	run grep "r-xp" /proc/$pid/maps
+done
+
+# Get node memory maps
+for pid in ${NODE_PID}; do
+	mycat /proc/$pid/smaps
+	mycat /proc/$pid/status
+done
+
+# CPU Performance Monitoring (always included in full mode)
+if [ "$STORAGE" != "TRUE" ]; then
+	# Check current CPU frequencies & scaling
+	run lscpu | grep CPU | grep MHz
+	# Check cpupower to see CPU idle states and power management
+	run cpupower monitor | head -20
+	# Check CPU governor settings
+	run cpupower frequency-info
+	# Check CPU topology and cache info
+	run lscpu -e
+fi
+
+# rc.local
+if [ -f /etc/rc.local ]; then
+	run cat /etc/rc.local
+fi
+
+run lspci -vv -nn -k
+
+# ZFS diagnostics (always included in full mode)
+if [ "$STORAGE" != "TRUE" ]; then
+	zfs_diagnostics
+fi
+
+# Generate comprehensive summary report (only for full mode, not storage-only)
+if [ "$STORAGE" != "TRUE" ]; then
+	generate_summary
+fi
+
+cd "$ORIGPWD"
+TGZ="blockchain-gather.${ID}.tar.gz"
+tar czf "$TGZ" -C "$TOPDIR" "$RELDIR"
+
+# Upload functionality temporarily disabled
+# if [ -n "$UPLOAD" ]; then
+# 	upload
+# 	exit 0
+# fi
+
+echo "==============================================================================="
+echo "Please submit the file: $TGZ"
+echo "==============================================================================="
