@@ -1,30 +1,32 @@
 # blockchain-gather
 
-A comprehensive diagnostic tool for blockchain node systems that collects system information, performance metrics, and configuration details to help troubleshoot node issues.
+`blockchaingather` is a single POSIX shell script (`/bin/sh`) that collects system diagnostics from a blockchain node host into a compressed tarball. It is designed to run non-invasively on production nodes and requires root privileges.
 
-Tested on Ubuntu 22.04+ systems.
+Primary platforms
+Tested: Debian-based systems (including Ubuntu 22.04+ systems)
+Untested: RHEL-based systems (including CentOS etc.)
 
 ## Quick Start
 
 ```bash
-wget -N https://raw.githubusercontent.com/nirvana-labs/nodes-blockchain-gather/main/blockchaingather
+wget -N https://raw.githubusercontent.com/vinpate/blockchaingather/main/blockchaingather
 sudo sh ./blockchaingather
 ```
 
-## What information is collected
+## What blockchaingather gathers
 
-The script generates a compressed archive containing detailed system diagnostics and blockchain-specific metrics. The output includes:
+blockchaingather gathers various system diagnostics, blockchain-specific metrics, and facts about your system. The output generates a tar.gz archive file.
+
+The tarball contains sets of paginated text files for each probe/test. How you interpret & what you do with the output is up to you.
 
 - Active blockchain node processes (op-reth, op-node, geth, erigon, parity, besu, nethermind, bitcoin, etc.)
 - System commands output: dmesg, netstat, ip, iptables, sysctl, free, vmstat, df, mount, lsb_release, uname with various diagnostic options
-- Docker container status and resource usage
+- Docker status and container identification & resource usage
 - Network port scanning and service identification
-- Storage device analysis including NVMe optimization checks
-- CPU performance metrics and power management settings
+- NVMe optimization checks
+- CPU performance metrics and power management setting validation
 - Memory utilization and process resource consumption
 - ZFS filesystem diagnostics (when available)
-
-This collection is designed to provide a complete picture of your blockchain node's system state and performance characteristics.
 
 The data helps identify potential issues such as network bottlenecks, storage misconfigurations, resource constraints, or suboptimal system settings that could impact blockchain node performance.
 
@@ -32,7 +34,7 @@ The data helps identify potential issues such as network bottlenecks, storage mi
 
 The collected data requires manual analysis. If there was an easy way to interpret the data I would have published `fixyourblockchain.sh` ;)
 
-Focus on the generated SUMMARY.txt and examine system logs for performance bottlenecks, resource constraints, and configuration problems that may affect your blockchain node's operation.
+Start with the generated SUMMARY.txt and examine relevant test files for granular analysis.
 
 ## Contributing
 
