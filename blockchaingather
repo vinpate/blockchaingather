@@ -21,9 +21,8 @@ export LC_ALL=C
 NODE_PID=""
 NODE_PID_COMMA=""
 UPLOAD=""
-STATCMD=""
 ITEM=0
-TOPDIR=$(mktemp -d ${TMPDIR:-/tmp}/blockchain-gather.XXXXXXXX)
+TOPDIR=$(mktemp -d "${TMPDIR:-/tmp}/blockchain-gather.XXXXXXXX")
 ID="$(cat /etc/hostname)-$(date +'%Y%m%d-%H%M%S')"
 RELDIR="blockchain-gather-$ID"
 ORIGPWD=$PWD
@@ -90,7 +89,7 @@ run() {
 runpipe_recurse() {
 	CMD="$1";
 	shift;
-	if [ "x$*" = "x" ]; then
+	if [ "$*" = "" ]; then
 		${CMD} 2>&1
 	else
 		${CMD} 2>&1 | runpipe_recurse "$@"
@@ -100,10 +99,10 @@ runpipe_recurse() {
 pipeprint() {
 	CMD="$1";
 	shift;
-	if [ "x$*" = "x" ]; then
-		echo ${CMD}
+	if [ "$*" = "" ]; then
+		echo "${CMD}"
 	else
-		echo ${CMD} "|" $(pipeprint "$@")
+		echo "${CMD}" "|" "$(pipeprint "$@")"
 	fi
 }
 
@@ -111,21 +110,20 @@ runpipe() {
 	incr
 	OLDLOG="$LOG"
 	LOG="${DIR}/$(item_num)_$(logname "$@")"
-	banner $(pipeprint "$@")
-	runpipe_recurse "$@" >> ${LOG} 2>&1
+	banner "$(pipeprint "$@")"
+	runpipe_recurse "$@" >> "${LOG}" 2>&1
 	LOG="$OLDLOG"
 }
 
 mycat() {
-	if [ -r $1 ]; then
-		run cat $1
+	if [ -r "$1" ]; then
+		run cat "$1"
 	else
 		incr
 	fi
 }
 
 get_pid() {
-	pidir="$(ls /proc/ | grep -E '^[0-9]+$' 2>&1)"
 	# NODE_PID detection is now handled automatically in the main script
 
 	if [ -z "${NODE_PID_COMMA}" ]; then
@@ -147,6 +145,7 @@ install_required_packages() {
 	if [ -f /etc/os-release ]; then
 		# Save our script version before sourcing os-release (which overwrites VERSION)
 		SCRIPT_VERSION="$VERSION"
+		# shellcheck source=/dev/null
 		. /etc/os-release
 		# Restore our script version
 		VERSION="$SCRIPT_VERSION"
@@ -180,9 +179,8 @@ install_required_packages() {
 		
 		# Install missing packages
 		info "Installing packages..."
-		apt install -y $missing_packages
-		
-		if [ $? -eq 0 ]; then
+		# shellcheck disable=SC2086
+		if apt install -y $missing_packages; then
 			info "Successfully installed required packages"
 		else
 			warn "Some packages failed to install. The script may not work completely."
@@ -195,7 +193,7 @@ install_required_packages() {
 check_tools() {
 	missing=
 	for command in systemctl journalctl ps netstat ss; do
-		if [ ! $(command -v $command) ]; then
+		if ! command -v "$command" >/dev/null 2>&1; then
 			missing="$missing$command "
 		fi
 	done
@@ -222,7 +220,7 @@ show_packages() {
 show_limits() {
 	# Get the first blockchain process PID, or use self if none found
 	if [ -n "$NODE_PID" ]; then
-		pid=$(echo $NODE_PID | awk '{print $1;}')
+		pid=$(echo "$NODE_PID" | awk '{print $1;}')
 	else
 		pid=$$
 	fi
@@ -234,13 +232,13 @@ show_limits() {
 	LOG="${DIR}/$(item_num)_limits"
 	banner limits
 	log "$file"
-	cat "$file" >> ${LOG} 2>&1
+	cat "$file" >> "${LOG}" 2>&1
 	LOG="$OLDLOG"
 }
 
 blockdev_cat() {
-	echo -n >>${LOG} "$1:"
-	cat "$1" >> ${LOG} 2>&1
+	printf '%s' "$1:" >> "${LOG}"
+	cat "$1" >> "${LOG}" 2>&1
 }
 
 call_blockdev() {
@@ -353,7 +351,7 @@ zfs_diagnostics() {
 	log ""
 	
 	# Get detailed pool status for each pool
-	zpool list -H -o name | while read pool; do
+	zpool list -H -o name | while read -r pool; do
 		if [ -n "$pool" ]; then
 			log "=== Pool: $pool - Detailed Status ==="
 			zpool status -v "$pool" >> "$LOG" 2>&1
@@ -511,10 +509,18 @@ generate_summary() {
 		echo "⛓️  BLOCKCHAIN NODE STATUS"
 		echo "==============================================================================="
 		echo "Active Blockchain Processes:"
-		ps aux | grep -E "(op-reth|op-node|geth|erigon|parity|besu|nethermind)" | grep -v grep | head -5 | awk '{print "  PID:", $2, "CPU:", $3"%", "MEM:", $4"%", "VSZ:", $5, "RSS:", $6, "CMD:", $11}' | sed 's/^/  /'
-		
+		pgrep -f '(op-reth|op-node|geth|erigon|parity|besu|nethermind)' 2>/dev/null | head -5 | \
+			while read -r pid; do
+				ps -o pid=,pcpu=,pmem=,vsz=,rss=,comm= -p "$pid" 2>/dev/null | \
+					awk 'NF{print "  PID:", $1, "CPU:", $2"%", "MEM:", $3"%", "VSZ:", $4, "RSS:", $5, "CMD:", $6}'
+			done
+
 		echo "Top Resource Consumers:"
-		ps -o pid,user,pmem,vsz,rss,comm --sort=-pmem | grep -E "(op-reth|op-node)" | head -3 | awk '{print "  PID:", $1, "USER:", $2, "MEM:", $3"%", "VSZ:", $4, "RSS:", $5, "CMD:", $6}' | sed 's/^/  /'
+		pgrep -f '(op-reth|op-node)' 2>/dev/null | \
+			while read -r pid; do
+				ps -o pid=,user=,pmem=,vsz=,rss=,comm= -p "$pid" 2>/dev/null
+			done | sort -k3 -rn | head -3 | \
+			awk 'NF{print "  PID:", $1, "USER:", $2, "MEM:", $3"%", "VSZ:", $4, "RSS:", $5, "CMD:", $6}'
 		echo ""
 		
 		# Docker Information
@@ -534,7 +540,7 @@ generate_summary() {
 		# Group by Docker containers
 		if command -v docker >/dev/null 2>&1; then
 			echo "  📦 Docker Containers:"
-			docker ps --format "table {{.Names}}\t{{.Ports}}" | grep -E "(eth|geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)" | while read line; do
+			docker ps --format "table {{.Names}}\t{{.Ports}}" | grep -E "(eth|geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)" | while read -r line; do
 				echo "    $line" | sed 's/^/      /'
 			done
 			echo ""
@@ -542,26 +548,27 @@ generate_summary() {
 		
 		# Group by running processes with enhanced detection
 		echo "  🔧 Running Processes:"
-		ps aux | grep -E "(geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)" | grep -v grep | while read line; do
-			process_name=$(echo "$line" | awk '{print $11}' | sed 's/.*\///')
-			pid=$(echo "$line" | awk '{print $2}')
-			user=$(echo "$line" | awk '{print $1}')
-			cpu=$(echo "$line" | awk '{print $3}')
-			mem=$(echo "$line" | awk '{print $4}')
-			
-			# Get ports for this process
-			ports=$(netstat -tulnp 2>/dev/null | grep "$pid/" | grep -oE ':[0-9]+' | cut -d: -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
-			
-			# Get command line arguments for port detection
-			cmd_line=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i}' | sed 's/ $//')
-			cmd_ports=$(echo "$cmd_line" | grep -oE '(port|rpc|ws|http|metrics|discovery|authrpc)\.port[=:][0-9]+|--port[=:][0-9]+|--rpc\.port[=:][0-9]+|--ws\.port[=:][0-9]+|--metrics[=:][0-9]+|--discovery\.port[=:][0-9]+|--authrpc\.port[=:][0-9]+' | grep -oE '[0-9]+' | tr '\n' ',' | sed 's/,$//')
-			
-			if [ -n "$ports" ] || [ -n "$cmd_ports" ]; then
-				all_ports=$(echo "$ports,$cmd_ports" | tr ',' '\n' | grep -v '^$' | sort -u | tr '\n' ',' | sed 's/,$//')
-				echo "    $process_name (PID: $pid, User: $user, CPU: ${cpu}%, MEM: ${mem}%) - Ports: $all_ports" | sed 's/^/      /'
-				echo "      Command: $cmd_line" | sed 's/^/        /'
-			fi
-		done
+		pgrep -f '(geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)' 2>/dev/null | \
+			while read -r pid; do
+				info=$(ps -o user=,pcpu=,pmem=,comm= -p "$pid" 2>/dev/null) || continue
+				user=$(echo "$info" | awk '{print $1}')
+				cpu=$(echo "$info"  | awk '{print $2}')
+				mem=$(echo "$info"  | awk '{print $3}')
+				comm=$(echo "$info" | awk '{print $4}')
+
+				# Get ports for this process
+				ports=$(netstat -tulnp 2>/dev/null | grep "$pid/" | grep -oE ':[0-9]+' | cut -d: -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+
+				# Get full command line for port argument detection
+				cmd_line=$(ps -o args= -p "$pid" 2>/dev/null | sed 's/[[:space:]]*$//')
+				cmd_ports=$(echo "$cmd_line" | grep -oE '(port|rpc|ws|http|metrics|discovery|authrpc)\.port[=:][0-9]+|--port[=:][0-9]+|--rpc\.port[=:][0-9]+|--ws\.port[=:][0-9]+|--metrics[=:][0-9]+|--discovery\.port[=:][0-9]+|--authrpc\.port[=:][0-9]+' | grep -oE '[0-9]+' | tr '\n' ',' | sed 's/,$//')
+
+				if [ -n "$ports" ] || [ -n "$cmd_ports" ]; then
+					all_ports=$(echo "$ports,$cmd_ports" | tr ',' '\n' | grep -v '^$' | sort -u | tr '\n' ',' | sed 's/,$//')
+					echo "    $comm (PID: $pid, User: $user, CPU: ${cpu}%, MEM: ${mem}%) - Ports: $all_ports" | sed 's/^/      /'
+					echo "      Command: $cmd_line" | sed 's/^/        /'
+				fi
+			done
 		echo ""
 		
 		# All detected blockchain ports (TCP and UDP)
@@ -581,7 +588,12 @@ generate_summary() {
 			PORTS2=$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -E '(eth|geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)' | grep -oE '[0-9]+->[0-9]+' | cut -d: -f1 | sort -u)
 			
 			# Method 3: Process command line detection
-			PORTS3=$(ps aux | grep -E '(geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)' | grep -v grep | grep -oE '(port|rpc|ws|http|metrics|discovery|authrpc)\.port[=:][0-9]+|--port[=:][0-9]+|--rpc\.port[=:][0-9]+|--ws\.port[=:][0-9]+|--metrics[=:][0-9]+|--discovery\.port[=:][0-9]+|--authrpc\.port[=:][0-9]+' | grep -oE '[0-9]+' | sort -u)
+			PORTS3=$(pgrep -f '(geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|reth|op-|base|optimism|arbitrum|polygon|avax|solana|cardano|polkadot|cosmos|near|algorand|tezos|chainlink|the-graph|indexer|node|validator|miner|consensus)' 2>/dev/null | \
+				while read -r pid; do
+					ps -o args= -p "$pid" 2>/dev/null
+				done | \
+				grep -oE '(port|rpc|ws|http|metrics|discovery|authrpc)\.port[=:][0-9]+|--port[=:][0-9]+|--rpc\.port[=:][0-9]+|--ws\.port[=:][0-9]+|--metrics[=:][0-9]+|--discovery\.port[=:][0-9]+|--authrpc\.port[=:][0-9]+' | \
+				grep -oE '[0-9]+' | sort -u)
 			
 			# Combine all methods, remove duplicates, and format
 			echo "$PORTS1 $PORTS2 $PORTS3" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' '|' | sed 's/|$//'
@@ -603,10 +615,10 @@ generate_summary() {
 		
 		# Map each detected port to its service (both TCP and UDP)
 		if [ -n "$BLOCKCHAIN_PORTS" ]; then
-			echo "$BLOCKCHAIN_PORTS" | tr '|' '\n' | while read port; do
+			echo "$BLOCKCHAIN_PORTS" | tr '|' '\n' | while read -r port; do
 				if [ -n "$port" ]; then
 					# Find what's listening on this port (both TCP and UDP)
-					netstat -tulnp | grep ":$port " | while read service_info; do
+					netstat -tulnp | grep ":$port " | while read -r service_info; do
 						if [ -n "$service_info" ]; then
 							proto=$(echo "$service_info" | awk '{print $1}')
 							address=$(echo "$service_info" | awk '{print $4}')
@@ -642,7 +654,7 @@ generate_summary() {
 			grep -A 10 "ZFS Pool Status" "$ZFS_FILE" | grep -E "(NAME|pool)" | sed 's/^/  /'
 			
 			# Check for ZFS health issues
-			ZFS_HEALTH=$(grep -A 20 "Health Check" "$ZFS_FILE" | grep -E "(DEGRADED|FAULTED|OFFLINE|UNAVAIL)" | wc -l)
+			ZFS_HEALTH=$(grep -A 20 "Health Check" "$ZFS_FILE" | grep -cE "(DEGRADED|FAULTED|OFFLINE|UNAVAIL)")
 			if [ "$ZFS_HEALTH" -gt 0 ]; then
 				echo "  ⚠️  ZFS Health Issues Detected:"
 				grep -A 20 "Health Check" "$ZFS_FILE" | grep -E "(DEGRADED|FAULTED|OFFLINE|UNAVAIL)" | sed 's/^/    /'
@@ -667,7 +679,9 @@ generate_summary() {
 		echo "==============================================================================="
 		
 		# Check for high memory usage
-		MEMORY_USAGE=$(ps -o pid,user,pmem,comm --sort=-pmem | grep "op-reth" | awk '{print $3}' | head -1 | sed 's/%//' 2>/dev/null)
+		MEMORY_USAGE=$(pgrep -f 'op-reth' 2>/dev/null | head -1 | while read -r pid; do
+			ps -o pmem= -p "$pid" 2>/dev/null
+		done | awk '{print $1}' | head -1 | sed 's/%//')
 		# Sanitize the memory usage to ensure it's a single integer
 		MEMORY_USAGE=$(echo "$MEMORY_USAGE" | tr -d '\n\r' | awk '{print $1}')
 		if [ -n "$MEMORY_USAGE" ] && [ "$MEMORY_USAGE" -gt 80 ] 2>/dev/null; then
@@ -766,7 +780,7 @@ Blockchain-gather gathers various system information into a single tar-ball.
 The script automatically detects all blockchain node processes and their
 arguments. No additional configuration is needed.
 _EOF_
-	exit $1
+	exit "$1"
 }
 
 ##############################
@@ -788,6 +802,10 @@ do
 	esac
 done
 
+# PERF and UPLOAD are set above but intentionally unused pending feature completion
+# shellcheck disable=SC2034
+: "${PERF}" "${UPLOAD}"
+
 shift $((OPTIND - 1))
 
 if [ $# -gt 0 ]
@@ -796,13 +814,11 @@ then
 	usage 1
 fi
 
-STATCMD=$NAME
-
 DIR="$TOPDIR/$RELDIR"
 LOG="$DIR/blockchain-gather.log"
 
 mkdir -p "$DIR"
-cd "$DIR"
+cd "$DIR" || exit 1
 
 cleanup () {
 	rm -rf "$TOPDIR"
@@ -827,7 +843,7 @@ install_required_packages
 
 check_tools
 
-if [ ! $(command -v pidof) ] || [ ! $(command -v pgrep) ]; then
+if ! command -v pidof >/dev/null 2>&1 || ! command -v pgrep >/dev/null 2>&1; then
 	 get_pid
 fi
 
@@ -842,7 +858,7 @@ run lsblk
 nvme_diagnostics
 	zfs_diagnostics
 	run lspci -vv -nn -k
-	cd "$ORIGPWD"
+	cd "$ORIGPWD" || exit 1
 	TGZ="blockchain-gather-storage.${ID}.tar.gz"
 	tar czf "$TGZ" -C "$TOPDIR" "$RELDIR"
 	echo "==============================================================================="
@@ -978,8 +994,8 @@ mycat /proc/meminfo
 mycat /proc/crypto
 mycat /proc/sys/net/ipv4/tcp_tw_reuse
 for pid in ${NODE_PID}; do
-	run cat -v /proc/$pid/cmdline
-	mycat /proc/$pid/cgroup
+	run cat -v /proc/"$pid"/cmdline
+	mycat /proc/"$pid"/cgroup
 done
 show_limits
 
@@ -990,7 +1006,7 @@ mycat /etc/nsswitch.conf
 run find /usr/local -name "*ethereum*" -o -name "*geth*" -o -name "*erigon*"
 
 for pid in ${NODE_PID}; do
-	run lsof -p $pid
+	run lsof -p "$pid"
 done
 
 for a in /sys/block/*; do
@@ -1018,16 +1034,17 @@ if  (lsmod | grep ip6_tables > /dev/null); then
 fi
 
 for pid in ${NODE_PID}; do
+	# shellcheck disable=SC2086
 	runpipe "awk '$2 ~ \"rw\"' /proc/$pid/maps" "wc -l"
 done
 
 for pid in ${NODE_PID}; do
-	run grep "r-xp" /proc/$pid/maps
+	run grep "r-xp" /proc/"$pid"/maps
 done
 
 for pid in ${NODE_PID}; do
-	mycat /proc/$pid/smaps
-	mycat /proc/$pid/status
+	mycat /proc/"$pid"/smaps
+	mycat /proc/"$pid"/status
 done
 
 if [ "$STORAGE" != "TRUE" ]; then
@@ -1051,7 +1068,7 @@ if [ "$STORAGE" != "TRUE" ]; then
 	generate_summary
 fi
 
-cd "$ORIGPWD"
+cd "$ORIGPWD" || exit 1
 TGZ="blockchain-gather.${ID}.tar.gz"
 tar czf "$TGZ" -C "$TOPDIR" "$RELDIR"
 
