@@ -2,21 +2,17 @@
 #
 # blockchain-node-gather - a data collection script for debugging blockchain node issues.
 #
-# This script is non-invasive and can be run on production blockchain
+# This script is non-invasive and can be run on production VMs/Blockchain
 # nodes with no ill effect.
 #
-# Copyright (C) 2024 Nirvana Labs. All rights reserved.
-#
-# This software is proprietary and confidential. It is intended for use by
-# Nirvana Labs and authorized parties only. Unauthorized copying, distribution,
-# modification, or use of this software is strictly prohibited and may result
-# in legal action.
+# Copyright (C) 2026 vinfrastructure
+# SPDX-License-Identifier: MIT
 #
 # This program is provided "as is" without warranty of any kind, either express
 # or implied, including but not limited to the implied warranties of
 # merchantability and fitness for a particular purpose.
 #
-# For licensing inquiries, contact: support@nirvanalabs.io
+# For licensing inquiries, contact: vin.pate95@gmail.com
 #
 
 export LC_ALL=C
@@ -149,7 +145,11 @@ install_required_packages() {
 	
 	# Check Ubuntu version
 	if [ -f /etc/os-release ]; then
+		# Save our script version before sourcing os-release (which overwrites VERSION)
+		SCRIPT_VERSION="$VERSION"
 		. /etc/os-release
+		# Restore our script version
+		VERSION="$SCRIPT_VERSION"
 		if [ "$ID" = "ubuntu" ]; then
 			UBUNTU_VERSION=$(echo "$VERSION_ID" | cut -d. -f1)
 			if [ "$UBUNTU_VERSION" -lt 22 ]; then
@@ -259,7 +259,6 @@ call_blockdev() {
 }
 
 nvme_diagnostics() {
-	incr
 	OLDLOG="$LOG"
 	LOG="${DIR}/$(item_num)_nvme_diagnostics"
 	banner "NVMe Drive Diagnostics"
@@ -278,10 +277,10 @@ nvme_diagnostics() {
 		log "=== NVMe Drive: $drive_path ==="
 		
 		# Basic NVMe info
-		run nvme id-ns --human-readable "$drive_path"
+		nvme id-ns --human-readable "$drive_path" >> "$LOG" 2>&1
 		
 		# LBA Format information
-		run nvme id-ns --human-readable "$drive_path" | grep '^LBA Format'
+		nvme id-ns --human-readable "$drive_path" | grep '^LBA Format' >> "$LOG" 2>&1
 		
 		# Detailed JSON analysis if jq is available
 		if command -v jq >/dev/null 2>&1; then
@@ -332,18 +331,102 @@ zfs_diagnostics() {
 	banner "ZFS Diagnostics"
 	
 	# Check if ZFS is available
-	if command -v zfs >/dev/null 2>&1; then
-		run zfs version
-		run zpool list
-		run zfs list
-		run zpool status
-		run zfs get all
-		run zpool get all
-		run zfs get -H -o name,property,value,source all | head -50
-		run zpool get -H -o name,property,value,source all | head -50
-	else
+	if ! command -v zfs >/dev/null 2>&1; then
 		log "ZFS not available on this system"
+		LOG="$OLDLOG"
+		return 0
 	fi
+	
+	# Check if ZFS kernel module is loaded
+	if ! lsmod | grep -q zfs; then
+		log "ZFS kernel module not loaded"
+		LOG="$OLDLOG"
+		return 0
+	fi
+	
+	log "=== ZFS Version Information ==="
+	zfs version >> "$LOG" 2>&1
+	log ""
+	
+	log "=== ZFS Pool Status ==="
+	zpool list >> "$LOG" 2>&1
+	log ""
+	
+	# Get detailed pool status for each pool
+	zpool list -H -o name | while read pool; do
+		if [ -n "$pool" ]; then
+			log "=== Pool: $pool - Detailed Status ==="
+			zpool status -v "$pool" >> "$LOG" 2>&1
+			log ""
+			
+			log "=== Pool: $pool - Properties ==="
+			zpool get all "$pool" >> "$LOG" 2>&1
+			log ""
+			
+			log "=== Pool: $pool - Health Check ==="
+			zpool status -x "$pool" >> "$LOG" 2>&1
+			log ""
+		fi
+	done
+	
+	log "=== ZFS Dataset Information ==="
+	zfs list -t all >> "$LOG" 2>&1
+	log ""
+	
+	# Get detailed dataset information
+	log "=== ZFS Dataset Properties (Top 50) ==="
+	zfs get -H -o name,property,value,source all | head -50 >> "$LOG" 2>&1
+	log ""
+	
+	# Get ZFS ARC statistics
+	log "=== ZFS ARC Statistics ==="
+	if [ -r /proc/spl/kstat/zfs/arcstats ]; then
+		cat /proc/spl/kstat/zfs/arcstats >> "$LOG" 2>&1
+	else
+		log "ARC statistics not available (requires ZFS kernel module)"
+	fi
+	log ""
+	
+	# Get ZFS memory usage
+	log "=== ZFS Memory Usage ==="
+	if [ -r /proc/spl/kstat/zfs/misc ]; then
+		cat /proc/spl/kstat/zfs/misc >> "$LOG" 2>&1
+	else
+		log "ZFS memory statistics not available"
+	fi
+	log ""
+	
+	# Check for ZFS snapshots
+	log "=== ZFS Snapshots ==="
+	zfs list -t snapshot >> "$LOG" 2>&1
+	log ""
+	
+	# Check ZFS compression ratio
+	log "=== ZFS Compression Ratios ==="
+	zfs list -o name,used,compressratio,compression >> "$LOG" 2>&1
+	log ""
+	
+	# Check ZFS deduplication
+	log "=== ZFS Deduplication Status ==="
+	zfs list -o name,dedup >> "$LOG" 2>&1
+	log ""
+	
+	# Check ZFS mount points
+	log "=== ZFS Mount Points ==="
+	mount | grep zfs >> "$LOG" 2>&1
+	log ""
+	
+	# Check ZFS service status
+	log "=== ZFS Service Status ==="
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl status zfs-import-cache zfs-import-scan zfs-mount zfs-share zfs-zed 2>/dev/null >> "$LOG" 2>&1
+	fi
+	log ""
+	
+	# Check ZFS kernel parameters
+	log "=== ZFS Kernel Parameters ==="
+	sysctl -a 2>/dev/null | grep zfs >> "$LOG" 2>&1
+	log ""
 	
 	LOG="$OLDLOG"
 }
@@ -373,19 +456,19 @@ generate_summary() {
 		LSB_FILE=$(find "${DIR}" -name "*lsb_release_-a" | head -1)
 		if [ -r "$LSB_FILE" ]; then
 			echo "Operating System:"
-			grep -A 3 "lsb_release -a" "$LSB_FILE" | grep -E "(Description|Release|Codename)" | sed 's/^/  /'
+			grep -A 3 "Item.*lsb_release -a" "$LSB_FILE" | tail -n +3 | grep -E "(Description|Release|Codename)" | sed 's/^/  /'
 		fi
 		
 		UNAME_FILE=$(find "${DIR}" -name "*uname_-a" | head -1)
 		if [ -r "$UNAME_FILE" ]; then
 			echo "Kernel:"
-			cat "$UNAME_FILE" | tail -1 | sed 's/^/  /'
+			sed -n '/Item.*uname -a/,/^$/p' "$UNAME_FILE" | tail -n +3 | sed 's/^/  /'
 		fi
 		
 		UPTIME_FILE=$(find "${DIR}" -name "*uptime" | head -1)
 		if [ -r "$UPTIME_FILE" ]; then
 			echo "Uptime:"
-			cat "$UPTIME_FILE" | tail -1 | sed 's/^/  /'
+			sed -n '/Item.*uptime/,/^$/p' "$UPTIME_FILE" | tail -n +3 | sed 's/^/  /'
 		fi
 		echo ""
 		
@@ -414,13 +497,13 @@ generate_summary() {
 		FREE_FILE=$(find "${DIR}" -name "*free_-m" | head -1)
 		if [ -r "$FREE_FILE" ]; then
 			echo "Memory:"
-			grep -A 3 "free -m" "$FREE_FILE" | grep -E "(Mem:|total|used|available)" | sed 's/^/  /'
+			grep -A 3 "Item.*free -m" "$FREE_FILE" | tail -n +3 | grep -E "(Mem:|total|used|available)" | sed 's/^/  /'
 		fi
 		
 		DF_FILE=$(find "${DIR}" -name "*df_-h" | head -1)
 		if [ -r "$DF_FILE" ]; then
 			echo "Storage:"
-			grep -A 10 "df -h" "$DF_FILE" | sed 's/^/  /'
+			grep -A 10 "Item.*df -h" "$DF_FILE" | tail -n +3 | sed 's/^/  /'
 		fi
 		echo ""
 		
@@ -520,8 +603,7 @@ generate_summary() {
 		
 		# Map each detected port to its service (both TCP and UDP)
 		if [ -n "$BLOCKCHAIN_PORTS" ]; then
-			IFS='|' read -ra PORTS_ARRAY <<< "$BLOCKCHAIN_PORTS"
-			for port in "${PORTS_ARRAY[@]}"; do
+			echo "$BLOCKCHAIN_PORTS" | tr '|' '\n' | while read port; do
 				if [ -n "$port" ]; then
 					# Find what's listening on this port (both TCP and UDP)
 					netstat -tulnp | grep ":$port " | while read service_info; do
@@ -550,6 +632,29 @@ generate_summary() {
 			echo "NVMe Drive Status:"
 			# Extract drive information more comprehensively
 			grep -A 100 "NVMe Drive Diagnostics" "$NVME_FILE" | grep -E "(drive.*nvme|is_optimal.*false|is_optimal.*true)" | sed 's/^/  /'
+		fi
+		
+		# ZFS Analysis
+		ZFS_FILE=$(find "${DIR}" -name "*zfs_diagnostics" | head -1)
+		if [ -r "$ZFS_FILE" ]; then
+			echo "ZFS Status:"
+			# Extract ZFS pool information
+			grep -A 10 "ZFS Pool Status" "$ZFS_FILE" | grep -E "(NAME|pool)" | sed 's/^/  /'
+			
+			# Check for ZFS health issues
+			ZFS_HEALTH=$(grep -A 20 "Health Check" "$ZFS_FILE" | grep -E "(DEGRADED|FAULTED|OFFLINE|UNAVAIL)" | wc -l)
+			if [ "$ZFS_HEALTH" -gt 0 ]; then
+				echo "  ⚠️  ZFS Health Issues Detected:"
+				grep -A 20 "Health Check" "$ZFS_FILE" | grep -E "(DEGRADED|FAULTED|OFFLINE|UNAVAIL)" | sed 's/^/    /'
+			else
+				echo "  ✅ ZFS pools appear healthy"
+			fi
+			
+			# Show ZFS compression ratios
+			echo "ZFS Compression:"
+			grep -A 10 "Compression Ratios" "$ZFS_FILE" | grep -E "(NAME|compressratio)" | sed 's/^/  /'
+		else
+			echo "ZFS: Not available or not configured"
 		fi
 		
 		echo "Block Devices:"
@@ -614,12 +719,11 @@ upload_fail() {
 	echo "==============================================================================="
 }
 
-# Upload gather to filebin using curl - TEMPORARILY DISABLED
+# Upload gather artifact with curl - TEMPORARILY DISABLED
 # upload() {
 # 	if command -v curl >/dev/null
 # 	then
-# 			FILEBIN="https://filebin.nirvanalabs.io"
-# 			# Generate BIN name
+# 			FILEBIN="https://your-filebin-domain.example.com"
 # 			BIN=$(head /dev/urandom | tr -dc a-z0-9 | head -c16)-T$UPLOAD
 # 			TGZ="blockchain-gather.${ID}.tar.gz"
 # 			if test ! -f ${TGZ}
@@ -630,7 +734,7 @@ upload_fail() {
 
 # 			URL="${FILEBIN}/${BIN}/${TGZ}"
 # 			CURLSTATUS=$(curl --data-binary "@$TGZ" $URL \
-# 				--header "Blockchain-gather: ${VERSION}" \
+# 				--header "X-Blockchain-Gather-Version: ${VERSION}" \
 # 				--progress-bar --silent --output /dev/null \
 # 				--connect-timeout 60 --max-time 1800 \
 # 				--write-out '%{http_code}')
@@ -657,7 +761,7 @@ Blockchain-gather gathers various system information into a single tar-ball.
  -h                   Show this help text
  -p                   Perform CPU performance monitoring (frequencies, idle states, power management)
  -s                   Run only storage diagnostics (NVMe, ZFS, disk info)
- -u <identifier>      Upload generated gather to filebin.nirvanalabs.io (TEMPORARILY DISABLED)
+-u <identifier>      Upload generated gather to configured file-sharing endpoint (TEMPORARILY DISABLED)
 
 The script automatically detects all blockchain node processes and their
 arguments. No additional configuration is needed.
@@ -694,7 +798,6 @@ fi
 
 STATCMD=$NAME
 
-# Set up environment
 DIR="$TOPDIR/$RELDIR"
 LOG="$DIR/blockchain-gather.log"
 
@@ -720,7 +823,6 @@ if [ "${USERID}" -ne "0" ]; then
 	sleep 10
 fi
 
-# Install required packages first
 install_required_packages
 
 check_tools
@@ -729,9 +831,6 @@ if [ ! $(command -v pidof) ] || [ ! $(command -v pgrep) ]; then
 	 get_pid
 fi
 
-# Node type detection is now automatic
-
-# If storage-only mode, run only storage diagnostics and exit
 if [ "$STORAGE" = "TRUE" ]; then
 	info "Running in storage-only mode"
 	run date
@@ -811,7 +910,6 @@ run systemctl cat \
 	op-node \
 	reth
 
-# Docker container information
 run docker ps -a
 run docker images | head -20
 run docker stats --no-stream
@@ -836,7 +934,6 @@ NETSTAT="/bin/netstat"
 run "$NETSTAT" -nlpt
 run "$NETSTAT" -np
 
-# Comprehensive Network Diagnostics
 banner "UFW Firewall Status"
 run ufw status numbered
 
@@ -859,17 +956,13 @@ banner "Network Connections by Process"
 run netstat -tulnp | awk 'NR>2 {print $7}' | cut -d/ -f2 | sort | uniq -c | sort -nr | head -10
 
 banner "Detailed Process Information"
-# Get top processes by connection count
 TOP_PROCESSES=$(netstat -tulnp | awk 'NR>2 {print $7}' | cut -d/ -f2 | sort | uniq -c | sort -nr | head -10 | awk '{print $2}' | grep -v '^$')
 
 for process in $TOP_PROCESSES; do
     if [ -n "$process" ]; then
         log "=== Process: $process ==="
-        # Get process details
         run ps aux | grep "$process" | grep -v grep | head -3
-        # Get memory and CPU usage
         run ps -o pid,user,pmem,pcpu,vsz,rss,comm,cmd --sort=-pmem | grep "$process" | head -3
-        # Get network connections for this process
         run netstat -tulnp | grep "$process" | head -5
         log ""
     fi
@@ -896,7 +989,6 @@ mycat /etc/nsswitch.conf
 
 run find /usr/local -name "*ethereum*" -o -name "*geth*" -o -name "*erigon*"
 
-# lsof
 for pid in ${NODE_PID}; do
 	run lsof -p $pid
 done
@@ -907,7 +999,6 @@ done
 
 run lsblk
 
-# Always include NVMe diagnostics
 nvme_diagnostics
 
 for a in /var/log/messages /var/log/syslog; do
@@ -918,7 +1009,6 @@ for a in /var/log/messages /var/log/syslog; do
 	fi
 done
 
-# ip tables
 if  (lsmod | grep ip_tables > /dev/null); then
 	run iptables-save
 fi
@@ -927,47 +1017,36 @@ if  (lsmod | grep ip6_tables > /dev/null); then
 	run ip6tables-save
 fi
 
-# maps
 for pid in ${NODE_PID}; do
 	runpipe "awk '$2 ~ \"rw\"' /proc/$pid/maps" "wc -l"
 done
 
-# Pick up the basic memory offset the text segments are in.
 for pid in ${NODE_PID}; do
 	run grep "r-xp" /proc/$pid/maps
 done
 
-# Get node memory maps
 for pid in ${NODE_PID}; do
 	mycat /proc/$pid/smaps
 	mycat /proc/$pid/status
 done
 
-# CPU Performance Monitoring (always included in full mode)
 if [ "$STORAGE" != "TRUE" ]; then
-	# Check current CPU frequencies & scaling
 	run lscpu | grep CPU | grep MHz
-	# Check cpupower to see CPU idle states and power management
 	run cpupower monitor | head -20
-	# Check CPU governor settings
 	run cpupower frequency-info
-	# Check CPU topology and cache info
 	run lscpu -e
 fi
 
-# rc.local
 if [ -f /etc/rc.local ]; then
 	run cat /etc/rc.local
 fi
 
 run lspci -vv -nn -k
 
-# ZFS diagnostics (always included in full mode)
 if [ "$STORAGE" != "TRUE" ]; then
 	zfs_diagnostics
 fi
 
-# Generate comprehensive summary report (only for full mode, not storage-only)
 if [ "$STORAGE" != "TRUE" ]; then
 	generate_summary
 fi
@@ -976,7 +1055,6 @@ cd "$ORIGPWD"
 TGZ="blockchain-gather.${ID}.tar.gz"
 tar czf "$TGZ" -C "$TOPDIR" "$RELDIR"
 
-# Upload functionality temporarily disabled
 # if [ -n "$UPLOAD" ]; then
 # 	upload
 # 	exit 0
