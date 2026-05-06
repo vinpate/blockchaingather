@@ -31,12 +31,6 @@ USERID=$(id -u)
 
 # Helpers
 
-# Takes a string, translates it into something we can use as a log
-# file name
-n_opt() {
-	echo "$1" | tr '/ ' __
-}
-
 item_num() {
 	printf "%.3d" "$ITEM"
 }
