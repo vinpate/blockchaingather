@@ -124,10 +124,11 @@ mycat() {
 }
 
 get_pid() {
-	# NODE_PID detection is now handled automatically in the main script
-
+	if [ -z "${NODE_PID}" ]; then
+		NODE_PID=$(pgrep -f '(avalanchego|op-reth|op-node|geth|erigon|parity|besu|nethermind|bitcoin|reth|anvil|foundry)' 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+	fi
 	if [ -z "${NODE_PID_COMMA}" ]; then
-		NODE_PID_COMMA=$(echo "${NODE_PID}" | tr '\n' ' ' | sed 's/ /,/g')
+		NODE_PID_COMMA=$(echo "${NODE_PID}" | tr ' ' ',' | sed 's/,*$//')
 	fi
 }
 
@@ -143,12 +144,14 @@ install_required_packages() {
 	
 	# Check Ubuntu version
 	if [ -f /etc/os-release ]; then
-		# Save our script version before sourcing os-release (which overwrites VERSION)
+		# Save script variables before sourcing os-release (which overwrites VERSION and ID)
 		SCRIPT_VERSION="$VERSION"
+		SCRIPT_ID="$ID"
 		# shellcheck source=/dev/null
 		. /etc/os-release
-		# Restore our script version
+		# Restore script variables
 		VERSION="$SCRIPT_VERSION"
+		ID="$SCRIPT_ID"
 		if [ "$ID" = "ubuntu" ]; then
 			UBUNTU_VERSION=$(echo "$VERSION_ID" | cut -d. -f1)
 			if [ "$UBUNTU_VERSION" -lt 22 ]; then
@@ -509,14 +512,14 @@ generate_summary() {
 		echo "⛓️  BLOCKCHAIN NODE STATUS"
 		echo "==============================================================================="
 		echo "Active Blockchain Processes:"
-		pgrep -f '(op-reth|op-node|geth|erigon|parity|besu|nethermind)' 2>/dev/null | head -5 | \
+		pgrep -f '(avalanchego|op-reth|op-node|geth|erigon|parity|besu|nethermind)' 2>/dev/null | head -5 | \
 			while read -r pid; do
 				ps -o pid=,pcpu=,pmem=,vsz=,rss=,comm= -p "$pid" 2>/dev/null | \
 					awk 'NF{print "  PID:", $1, "CPU:", $2"%", "MEM:", $3"%", "VSZ:", $4, "RSS:", $5, "CMD:", $6}'
 			done
 
 		echo "Top Resource Consumers:"
-		pgrep -f '(op-reth|op-node)' 2>/dev/null | \
+		pgrep -f '(avalanchego|op-reth|op-node)' 2>/dev/null | \
 			while read -r pid; do
 				ps -o pid=,user=,pmem=,vsz=,rss=,comm= -p "$pid" 2>/dev/null
 			done | sort -k3 -rn | head -3 | \
@@ -824,7 +827,7 @@ cleanup () {
 	rm -rf "$TOPDIR"
 	exit 1
 }
-trap cleanup EXIT 2
+trap cleanup INT
 
 info "Blockchain-gather version: $VERSION"
 info "Invoked by: $USERID"
@@ -843,9 +846,7 @@ install_required_packages
 
 check_tools
 
-if ! command -v pidof >/dev/null 2>&1 || ! command -v pgrep >/dev/null 2>&1; then
-	 get_pid
-fi
+get_pid
 
 if [ "$STORAGE" = "TRUE" ]; then
 	info "Running in storage-only mode"
@@ -861,6 +862,7 @@ nvme_diagnostics
 	cd "$ORIGPWD" || exit 1
 	TGZ="blockchain-gather-storage.${ID}.tar.gz"
 	tar czf "$TGZ" -C "$TOPDIR" "$RELDIR"
+	rm -rf "$TOPDIR"
 	echo "==============================================================================="
 	echo "Storage diagnostics complete. Please submit the file: $TGZ"
 	echo "==============================================================================="
@@ -874,7 +876,7 @@ mycat /etc/hostname
 mycat /var/log/dmesg
 mycat /proc/cpuinfo
 mycat /proc/version
-runpipe "ps aux" "egrep (geth|erigon|parity|besu|nethermind|bitcoin|ethereum|blockchain|node|op-reth|op-node|reth|anvil|foundry)"
+runpipe "ps aux" "egrep (avalanchego|geth|erigon|parity|besu|nethermind|bitcoin|ethereum|blockchain|node|op-reth|op-node|reth|anvil|foundry)"
 runpipe "netstat -np" "wc -l"
 runpipe "netstat -np" "grep ESTABLISHED" "wc -l"
 run uptime
@@ -924,7 +926,8 @@ run systemctl cat \
 	bitcoin \
 	op-reth \
 	op-node \
-	reth
+	reth \
+	avalanchego
 
 run docker ps -a
 run docker images | head -20
@@ -966,7 +969,7 @@ banner "ARP Table"
 run ip neigh show
 
 banner "Blockchain Network Analysis"
-run netstat -tulnp | grep -E "(op-reth|op-node|geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|docker-prox)"
+run netstat -tulnp | grep -E "(avalanchego|op-reth|op-node|geth|erigon|parity|besu|nethermind|bitcoin|foundry|anvil|docker-prox)"
 
 banner "Network Connections by Process"
 run netstat -tulnp | awk 'NR>2 {print $7}' | cut -d/ -f2 | sort | uniq -c | sort -nr | head -10
@@ -1019,7 +1022,7 @@ nvme_diagnostics
 
 for a in /var/log/messages /var/log/syslog; do
 	if [ -r "$a" ]; then
-		run egrep -i "(ethereum|geth|erigon|parity|besu|nethermind|bitcoin|blockchain|node|op-reth|op-node|reth|anvil|foundry|base|optimism|arbitrum|polygon)" "$a"
+		run egrep -i "(avalanchego|avax|ethereum|geth|erigon|parity|besu|nethermind|bitcoin|blockchain|node|op-reth|op-node|reth|anvil|foundry|base|optimism|arbitrum|polygon)" "$a"
 	else
 		incr
 	fi
@@ -1077,6 +1080,7 @@ tar czf "$TGZ" -C "$TOPDIR" "$RELDIR"
 # 	exit 0
 # fi
 
+rm -rf "$TOPDIR"
 echo "==============================================================================="
 echo "Please submit the file: $TGZ"
 echo "==============================================================================="
